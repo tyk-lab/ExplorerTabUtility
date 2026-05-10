@@ -368,6 +368,11 @@ public class ExplorerWatcher : IHook
     }
     private async void OnShellWindowRegistered(int __)
     {
+        // Yield immediately to free the COM event thread before any re-entrant COM calls.
+        // In newer Windows 11, Explorer's STA may not re-enter while waiting for ShellWindows
+        // registration to complete, causing a deadlock if we call back into Explorer synchronously.
+        await Task.Yield();
+
         var showAgain = true;
         nint hWnd = 0;
         try
@@ -441,9 +446,11 @@ public class ExplorerWatcher : IHook
         catch {/**/}
         finally
         {
-            if (showAgain)
+            if (showAgain && hWnd != 0)
             {
-                await Helper.DoUntilNotDefaultAsync(() => Helper.ShowWindow(hWnd, removeCache: false), 1_500, 200);
+                // OnWindowShown (UI thread) might have hidden the window in a race with PreventWindowHiding.
+                // Poll briefly; the race window is tiny so 500ms is more than sufficient.
+                await Helper.DoUntilNotDefaultAsync(() => Helper.ShowWindow(hWnd, removeCache: false), 500, 50);
 
                 if (!SettingsManager.HaveThemeIssue)
                     Helper.UpdateWindowLayered(hWnd, remove: true);
@@ -706,8 +713,11 @@ public class ExplorerWatcher : IHook
     }
     private Task<nint> GetTabHandle(InternetExplorer window)
     {
-        if (_windowEntryDict.TryGetValue(window, out WindowEntry entry) && entry.OptionalKey is { } handle and > 0)
-            return Task.FromResult(handle);
+        lock (_windowEntryDictLock)
+        {
+            if (_windowEntryDict.TryGetValue(window, out WindowEntry entry) && entry.OptionalKey is { } handle and > 0)
+                return Task.FromResult(handle);
+        }
 
         // Schedule the operation on STA
         return RunInStaThread(() =>
@@ -723,7 +733,13 @@ public class ExplorerWatcher : IHook
                 shellBrowser.GetWindow(out var hWnd);
 
                 if (hWnd != 0)
-                    _windowEntryDict.UpdateOptionalKey(window, hWnd);
+                {
+                    lock (_windowEntryDictLock)
+                    {
+                        if (_windowEntryDict.ContainsPrimary(window))
+                            _windowEntryDict.UpdateOptionalKey(window, hWnd);
+                    }
+                }
 
                 return hWnd;
             }
@@ -904,9 +920,13 @@ public class ExplorerWatcher : IHook
         _windowRegisteredHandler = OnShellWindowRegistered;
         _shellWindows.WindowRegistered += _windowRegisteredHandler;
 
-        // Hook the global "OBJECT_SHOW" event
+        // Hook the global "OBJECT_SHOW" event on the UI thread, because WINEVENT_OUTOFCONTEXT
+        // hooks require a message loop on the registering thread to deliver callbacks.
         _eventObjectShowHookCallback = OnWindowShown;
-        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+        {
+            _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+        });
 
         // Hook the event handlers for already-open windows
         var hasOpen = false;
@@ -941,7 +961,8 @@ public class ExplorerWatcher : IHook
         }
         if (_eventObjectShowHookCallback != null)
         {
-            WinApi.UnhookWinEvent(_eventObjectShowHookId);
+            var hookId = _eventObjectShowHookId;
+            System.Windows.Application.Current.Dispatcher.Invoke(() => WinApi.UnhookWinEvent(hookId));
             _eventObjectShowHookCallback = null;
         }
 
